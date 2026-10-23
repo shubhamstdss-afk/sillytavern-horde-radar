@@ -1,100 +1,185 @@
 import { extension_settings } from "../../../extensions.js";
 import { saveSettingsDebounced } from "../../../../script.js";
 
-// --- 1. Core data and cache initialization ---
-const EXT_ID = 'hordeRadarApp';
-if (!extension_settings[EXT_ID]) {
-    extension_settings[EXT_ID] = {};
-}
+// AI Horde Radar — English UI, architecture-aware classification, safe syncing.
+const EXT_ID = "hordeRadarApp";
+if (!extension_settings[EXT_ID]) extension_settings[EXT_ID] = {};
 
 let globalModelsData = [];
+let selectedModelName = "";
+let currentFamilyFilter = "all";
+let currentSearch = "";
 
+// Conservative defaults for architectures supported by this extension.
+// Unknown families never receive guessed settings.
 const BASE_PARAMS = {
-    sdxl: { width: 832, height: 1216, sampler: "k_euler_a", steps: 30, scale: 7, clip_skip: 2, karras: false },
-    sd15: { width: 512, height: 768, sampler: "k_dpmpp_2m", steps: 25, scale: 7, clip_skip: 2, karras: true }
+    sdxl: {
+        width: 832,
+        height: 1216,
+        sampler: "k_euler_a",
+        steps: 30,
+        scale: 7,
+        clip_skip: 2,
+        karras: false
+    },
+    sd15: {
+        width: 512,
+        height: 768,
+        sampler: "k_dpmpp_2m",
+        steps: 25,
+        scale: 7,
+        clip_skip: 2,
+        karras: true
+    }
 };
 
-// --- Advanced model scoring (excludes unreliable queued data) ---
+function escapeHtml(value) {
+    return String(value ?? "").replace(/[&<>"']/g, char => ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#39;"
+    })[char]);
+}
+
 function calculateModelScore(m) {
-    const perf = m.performance || 0;
-    const count = m.count || 0;
-    const eta = m.eta || 0;
-    const jobs = m.jobs || 0;
+    const perf = Number(m.performance) || 0;
+    const count = Number(m.count) || 0;
+    const eta = Number(m.eta) || 0;
+    const jobs = Number(m.jobs) || 0;
 
-    // 1. Smooth performance
     const smoothPerf = Math.log10(perf + 10);
-
-    // 2. Detect idle workers and apply availability bonus
     const idleWorkers = Math.max(0, count - jobs);
-    const availabilityBonus = idleWorkers > 0 ? Math.sqrt(count) * 1.5 : Math.sqrt(count);
+    const availabilityBonus = idleWorkers > 0
+        ? Math.sqrt(count) * 1.5
+        : Math.sqrt(count);
 
-    // 3. Estimate queue pressure using jobs only
     const realQueuePressure = jobs / (count + 0.1);
-
-    // 4. Apply a non-linear ETA penalty
     const penaltyETA = Math.pow(eta + 1, 1.2);
 
-    return (smoothPerf * availabilityBonus * 100) / (penaltyETA + realQueuePressure * 0.5);
+    return (smoothPerf * availabilityBonus * 100)
+        / (penaltyETA + realQueuePressure * 0.5);
 }
 
-// --- 2. Smart model classification and parameter selection ---
-function analyzeModel(mName, baseline, style, rawDesc) {
-    const n = (mName || "").toLowerCase();
-    const b = (baseline || "").toLowerCase();
-    const s = (style || "").toLowerCase();
-    const d = (rawDesc || "").toLowerCase();
+// Classify using the model reference's baseline first.
+// Unknown or unsupported architectures receive no automatic parameters.
+function classifyModel(name, info = {}) {
+    const modelName = String(name || "").toLowerCase();
+    const baseline = String(info.baseline || "")
+        .toLowerCase()
+        .replace(/[_-]+/g, " ");
+    const style = String(info.style || "").toLowerCase();
+    const desc = String(info.description || "").toLowerCase();
+    const tags = Array.isArray(info.tags)
+        ? info.tags.join(" ").toLowerCase()
+        : "";
 
-    // Keep these internal preset names unchanged so existing
-    // SillyTavern style presets continue to match.
-    let presetStyle = "SD 1.5 (纯写实/真人照)";
-    let params = BASE_PARAMS.sd15;
+    const text = `${modelName} ${baseline} ${style} ${desc} ${tags}`;
 
-    if (b.includes("pony") || n.includes("pony") || s.includes("pony")) {
-        presetStyle = "Pony (动漫/R-18)";
-        params = BASE_PARAMS.sdxl;
-    } else if (b.includes("xl") || b.includes("sdxl")) {
-        presetStyle = "SDXL (写实/通用)";
-        params = BASE_PARAMS.sdxl;
-    } else if (
-        s.includes("anime") ||
-        s.includes("2.5d") ||
-        d.includes("anime") ||
-        d.includes("2.5d") ||
-        n.includes("mix") ||
-        n.includes("rev animated")
+    if (
+        baseline.includes("pony") ||
+        modelName.includes("pony") ||
+        style.includes("pony")
     ) {
-        presetStyle = "SD 1.5 (动漫/韩漫2.5D)";
+        return {
+            family: "pony",
+            familyLabel: "Pony (SDXL-based)",
+            params: BASE_PARAMS.sdxl
+        };
     }
 
-    let shortTags = [];
+    if (
+        baseline.includes("stable diffusion xl") ||
+        baseline.includes("sdxl") ||
+        baseline.trim() === "xl" ||
+        modelName.includes("sdxl")
+    ) {
+        return {
+            family: "sdxl",
+            familyLabel: "SDXL",
+            params: BASE_PARAMS.sdxl
+        };
+    }
 
-    if (d.includes("anime")) shortTags.push("Anime");
-    if (d.includes("realistic") || d.includes("photoreal")) shortTags.push("Photorealistic");
-    if (d.includes("2.5d") || d.includes("blend")) shortTags.push("2.5D");
-    if (d.includes("hands")) shortTags.push("Hand-fix");
-    if (d.includes("nsfw")) shortTags.push("NSFW-friendly");
+    const isSD15 =
+        baseline.includes("stable diffusion 1") ||
+        baseline.includes("sd 1.5") ||
+        baseline.includes("sd15") ||
+        baseline.trim() === "sd1";
 
-    const shortDesc = shortTags.length > 0
-        ? `Style tags: ${shortTags.join(", ")}`
-        : "Mixed style";
+    if (isSD15) {
+        const anime = /anime|manga|manhwa|2\.5d|animated|waifu/.test(text);
 
-    return { presetStyle, params, shortDesc };
+        return {
+            family: anime ? "sd15_anime" : "sd15_real",
+            familyLabel: anime
+                ? "SD 1.5 · Anime / 2.5D"
+                : "SD 1.5 · General / Realistic",
+            params: BASE_PARAMS.sd15
+        };
+    }
+
+    // Flux, Qwen Image, SD 2.x and unknown families remain discoverable.
+    // We deliberately do not assume their sampler, resolution or other settings.
+    let label = "Other / Unclassified";
+
+    if (text.includes("flux")) {
+        label = "Flux · settings not configured";
+    } else if (text.includes("qwen")) {
+        label = "Qwen Image · settings not configured";
+    } else if (
+        baseline.includes("stable diffusion 2") ||
+        baseline.includes("sd 2")
+    ) {
+        label = "SD 2.x · settings not configured";
+    }
+
+    return {
+        family: "other",
+        familyLabel: label,
+        params: null
+    };
 }
 
-// Convert internal preset identifiers to English for display only.
-function displayPresetStyle(style) {
-    const labels = {
-        "Pony (动漫/R-18)": "Pony (Anime / R-18)",
-        "SDXL (写实/通用)": "SDXL (Realistic / General)",
-        "SD 1.5 (动漫/韩漫2.5D)": "SD 1.5 (Anime / Manhwa 2.5D)",
-        "SD 1.5 (纯写实/真人照)": "SD 1.5 (Photorealistic)"
+function getStyleCandidates(model) {
+    const english = {
+        pony: [
+            "Pony (Anime / R-18)",
+            "Pony"
+        ],
+        sdxl: [
+            "SDXL (Realistic / General)",
+            "SDXL"
+        ],
+        sd15_anime: [
+            "SD 1.5 (Anime / 2.5D)",
+            "SD 1.5 Anime"
+        ],
+        sd15_real: [
+            "SD 1.5 (Photorealistic)",
+            "SD 1.5 Realistic"
+        ]
     };
 
-    return labels[style] || style;
+    // Legacy names remain supported for existing SillyTavern presets.
+    const legacy = {
+        pony: ["Pony (动漫/R-18)"],
+        sdxl: ["SDXL (写实/通用)"],
+        sd15_anime: ["SD 1.5 (动漫/韩漫2.5D)"],
+        sd15_real: ["SD 1.5 (纯写实/真人照)"]
+    };
+
+    return [
+        ...(english[model.family] || []),
+        ...(legacy[model.family] || [])
+    ];
 }
 
-// --- 3. Build and inject the UI ---
-jQuery(async () => {
+// --- User interface ---
+jQuery(() => {
+    if ($("#horde-radar-root").length) return;
+
     const uiHtml = `
         <div class="extension-settings">
             <div class="inline-drawer">
@@ -103,398 +188,536 @@ jQuery(async () => {
                     <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
                 </div>
 
-                <div class="inline-drawer-content" style="padding: 15px; background: #121212; color: #eee; border-radius: 8px;">
+                <div class="inline-drawer-content"
+                     style="padding:15px;background:#121212;color:#eee;border-radius:8px;">
 
-                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; border-bottom: 1px solid #333; padding-bottom: 10px;">
-                        <span id="horde-radar-status" style="font-size: 12px; color: #aaa;">Waiting for data...</span>
-                        <button id="btn-horde-refresh" class="menu_button" style="margin: 0; font-weight: bold;">📡 Refresh Radar</button>
+                    <div style="display:flex;justify-content:space-between;
+                                align-items:center;gap:10px;margin-bottom:12px;
+                                border-bottom:1px solid #333;padding-bottom:10px;">
+                        <span id="horde-radar-status"
+                              style="font-size:12px;color:#aaa;">
+                            Waiting for data...
+                        </span>
+                        <button id="btn-horde-refresh" class="menu_button"
+                                style="margin:0;font-weight:bold;white-space:nowrap;">
+                            📡 Refresh
+                        </button>
                     </div>
 
-                    <div style="display: flex; flex-direction: column; gap: 8px; margin-bottom: 15px;">
-                        ${buildSelectRow("all", "🏆 Best Overall")}
-                        ${buildSelectRow("pony", "🦄 Pony (Anime / R-18)")}
-                        ${buildSelectRow("sdxl", "📸 SDXL (Realistic / General)")}
-                        ${buildSelectRow("sd15_anime", "🌸 SD 1.5 (Anime / Manhwa)")}
-                        ${buildSelectRow("sd15_real", "🎞️ SD 1.5 (Photorealistic)")}
+                    <div style="display:flex;flex-direction:column;gap:8px;margin-bottom:12px;">
+
+                        <label for="horde-family-filter"
+                               style="font-size:12px;color:#bb86fc;font-weight:bold;">
+                            Architecture / Family
+                        </label>
+
+                        <select id="horde-family-filter"
+                                style="width:100%;background:#222;color:#eee;
+                                       border:1px solid #444;padding:7px;border-radius:4px;">
+                            <option value="all">
+                                All families (alphabetical; scores not compared across families)
+                            </option>
+                            <option value="pony">Pony (SDXL-based)</option>
+                            <option value="sdxl">SDXL</option>
+                            <option value="sd15_anime">SD 1.5 · Anime / 2.5D</option>
+                            <option value="sd15_real">SD 1.5 · General / Realistic</option>
+                            <option value="other">
+                                Other / Unclassified (including unsupported architectures)
+                            </option>
+                        </select>
+
+                        <label for="horde-model-search"
+                               style="font-size:12px;color:#bb86fc;font-weight:bold;">
+                            Search Models
+                        </label>
+
+                        <input id="horde-model-search"
+                               type="search"
+                               placeholder="Search name, baseline, style, or description..."
+                               style="width:100%;box-sizing:border-box;background:#222;
+                                      color:#eee;border:1px solid #444;padding:8px;
+                                      border-radius:4px;" />
+
+                        <label for="horde-model-select"
+                               style="font-size:12px;color:#bb86fc;font-weight:bold;">
+                            Available Models
+                        </label>
+
+                        <select id="horde-model-select"
+                                size="8"
+                                style="width:100%;background:#222;color:#eee;
+                                       border:1px solid #444;padding:6px;
+                                       border-radius:4px;min-height:150px;">
+                        </select>
+
+                        <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                            <button id="btn-horde-sync" class="menu_button" style="margin:0;">
+                                ⚙️ Sync Model / Settings
+                            </button>
+                            <button id="btn-horde-info" class="menu_button" style="margin:0;">
+                                ℹ️ Show Details
+                            </button>
+                        </div>
+
+                        <div style="font-size:11px;color:#999;line-height:1.4;">
+                            Scores use the existing formula and should only be compared
+                            within the same supported family. Unknown architectures are
+                            listed without guessed parameter settings.
+                        </div>
                     </div>
 
-                    <div id="horde-info-panel" style="display: none; background: #1e1e1e; border: 1px solid #444; border-radius: 8px; padding: 15px; font-size: 13px;">
+                    <div id="horde-info-panel"
+                         style="display:none;background:#1e1e1e;border:1px solid #444;
+                                border-radius:8px;padding:12px;font-size:13px;">
                     </div>
-
                 </div>
             </div>
         </div>
     `;
 
-    $('#extensions_settings').append(uiHtml);
+    $("#extensions_settings").append(
+        `<div id="horde-radar-root">${uiHtml}</div>`
+    );
 
-    // Bind events
-    $('#btn-horde-refresh').on('click', fetchHordeData);
+    $("#btn-horde-refresh").on("click", fetchHordeData);
 
-    $(document).on('click', '.btn-horde-sync', function () {
-        syncToST($(this).data('target'));
+    $("#horde-family-filter").on("change", function () {
+        currentFamilyFilter = $(this).val() || "all";
+        renderModelList();
     });
 
-    $(document).on('click', '.btn-horde-info', function () {
-        showInfoPanel($(this).data('target'));
+    $("#horde-model-search").on("input", function () {
+        currentSearch = String($(this).val() || "").trim().toLowerCase();
+        renderModelList();
     });
 
-    // Bind direct-sync and single-model refresh buttons
-    $(document).on('click', '.btn-horde-sync-direct', function () {
-        executeSync($(this).data('model'));
+    $("#horde-model-select")
+        .on("change", function () {
+            selectedModelName = $(this).val() || "";
+        })
+        .on("dblclick", showInfoPanel);
+
+    $("#btn-horde-sync").on("click", () => {
+        if (!selectedModelName) {
+            return toastr.warning("Select a model first.");
+        }
+        executeSync(selectedModelName);
     });
 
-    $(document).on('click', '.btn-horde-refresh-single', function () {
-        refreshSingleModel($(this));
-    });
+    $("#btn-horde-info").on("click", showInfoPanel);
 
     fetchHordeData();
 });
 
-function buildSelectRow(id, label) {
-    return `
-        <div style="display: flex; gap: 8px; align-items: center;">
-            <div style="width: 140px; font-size: 12px; font-weight: bold; color: #bb86fc; flex-shrink: 0;">${label}</div>
+async function fetchJson(url) {
+    const response = await fetch(url);
 
-            <select id="horde-sel-${id}" style="flex: 1; background: #222; color: #eee; border: 1px solid #444; padding: 6px; border-radius: 4px;">
-                <option value="">-- Waiting for scan --</option>
-            </select>
+    if (!response.ok) {
+        throw new Error(`HTTP ${response.status} for ${url}`);
+    }
 
-            <button class="menu_button btn-horde-sync" data-target="${id}" title="Sync parameters" style="margin:0; padding: 6px 10px;">⚙️ Sync</button>
-
-            <button class="menu_button btn-horde-info" data-target="${id}" title="View details" style="margin:0; padding: 6px 10px;">ℹ️ Details</button>
-        </div>
-    `;
+    return response.json();
 }
 
-// --- 4. Fetch model data ---
+// --- Fetch live status and model metadata ---
 async function fetchHordeData() {
-    $('#horde-radar-status').text('Connecting to AI Horde and GitHub...');
-    $('#btn-horde-refresh').prop('disabled', true);
+    $("#horde-radar-status").text(
+        "Connecting to AI Horde and model reference..."
+    );
+    $("#btn-horde-refresh").prop("disabled", true);
 
     try {
-        const [statusRes, infoRes] = await Promise.all([
-            fetch('https://aihorde.net/api/v2/status/models'),
-            fetch('https://raw.githubusercontent.com/Haidra-Org/AI-Horde-image-model-reference/main/stable_diffusion.json')
-        ]);
+        const statusPromise = fetchJson(
+            "https://aihorde.net/api/v2/status/models"
+        );
 
-        const statusData = await statusRes.json();
-        const infoDict = await infoRes.json();
+        const referencePromise = fetchJson(
+            "https://models.aihorde.net/api/model_references/v2/image_generation"
+        ).catch(() => fetchJson(
+            "https://raw.githubusercontent.com/Haidra-Org/AI-Horde-image-model-reference/main/stable_diffusion.json"
+        ));
+
+        const [statusData, infoDict] = await Promise.all([
+            statusPromise,
+            referencePromise
+        ]);
 
         globalModelsData = [];
 
-        statusData.forEach(m => {
-            if (m.type === "image" && m.count > 0) {
-                const info = infoDict[m.name] || {};
-                const optimalScore = calculateModelScore(m);
-                const analysis = analyzeModel(
-                    m.name,
-                    info.baseline,
-                    info.style,
-                    info.description
-                );
-
-                globalModelsData.push({
-                    name: m.name,
-                    workers: m.count,
-                    performance: Math.round(m.performance),
-                    eta: m.eta,
-                    jobs: m.jobs,
-                    score: optimalScore,
-                    nsfw: info.nsfw === true,
-                    baseline: info.baseline || "Unknown",
-                    version: info.version || "Unknown",
-                    style: info.style || "Mixed",
-                    rawDesc: info.description || "",
-                    showcases: info.showcases || [],
-                    presetStyle: analysis.presetStyle,
-                    shortDesc: analysis.shortDesc,
-                    params: analysis.params
-                });
+        statusData.forEach(status => {
+            if (status.type !== "image" || !(Number(status.count) > 0)) {
+                return;
             }
+
+            const info = infoDict[status.name] || {};
+            const classification = classifyModel(status.name, info);
+
+            globalModelsData.push({
+                name: status.name,
+                workers: Number(status.count) || 0,
+                performance: Math.round(Number(status.performance) || 0),
+                eta: Number(status.eta) || 0,
+                jobs: Number(status.jobs) || 0,
+                score: calculateModelScore(status),
+                nsfw: info.nsfw === true,
+                baseline: info.baseline || "Unknown baseline",
+                version: info.version || "Unknown",
+                style: info.style || "Not specified",
+                rawDesc: info.description || "",
+                showcases: Array.isArray(info.showcases) ? info.showcases : [],
+                tags: Array.isArray(info.tags) ? info.tags : [],
+                family: classification.family,
+                familyLabel: classification.familyLabel,
+                params: classification.params
+            });
         });
 
-        globalModelsData.sort((a, b) => b.score - a.score);
+        renderModelList();
 
-        populateDropdowns();
+        $("#horde-radar-status").text(
+            `✅ Loaded ${globalModelsData.length} active image models · ` +
+            new Date().toLocaleTimeString()
+        );
+    } catch (error) {
+        console.error("AI Horde Radar: data fetch failed.", error);
 
-        $('#horde-radar-status').text(
-            `✅ Loaded ${globalModelsData.length} models | ${new Date().toLocaleTimeString('en-US', { hour12: false })}`
+        $("#horde-radar-status").text(
+            "❌ Could not load model data. Check your connection and retry."
         );
 
-    } catch (error) {
-        console.error('AI Horde Radar: Failed to fetch model data.', error);
-        $('#horde-radar-status').text('❌ Failed to fetch data. Please try again.');
+        toastr.error(
+            "Could not load AI Horde model data. Check the browser console for details."
+        );
     } finally {
-        $('#btn-horde-refresh').prop('disabled', false);
+        $("#btn-horde-refresh").prop("disabled", false);
     }
 }
 
-function populateDropdowns() {
-    const sels = {
-        all: $('#horde-sel-all').empty().append('<option value="">-- Select a model --</option>'),
-        pony: $('#horde-sel-pony').empty().append('<option value="">-- Select a model --</option>'),
-        sdxl: $('#horde-sel-sdxl').empty().append('<option value="">-- Select a model --</option>'),
-        sd15_anime: $('#horde-sel-sd15_anime').empty().append('<option value="">-- Select a model --</option>'),
-        sd15_real: $('#horde-sel-sd15_real').empty().append('<option value="">-- Select a model --</option>')
-    };
+// --- Search, filter and sort the model browser ---
+function renderModelList() {
+    const $select = $("#horde-model-select");
+    if (!$select.length) return;
 
-    globalModelsData.forEach(m => {
-        const text = `${m.name} ${m.nsfw ? '🔞' : ''} (${m.workers} workers)`;
-        const opt = `<option value="${m.name}">${text}</option>`;
+    const previous = selectedModelName || $select.val() || "";
 
-        sels.all.append(opt);
+    let models = globalModelsData.filter(model => {
+        const familyMatch =
+            currentFamilyFilter === "all" ||
+            model.family === currentFamilyFilter;
 
-        // Internal preset names are deliberately unchanged.
-        if (m.presetStyle === "Pony (动漫/R-18)") {
-            sels.pony.append(opt);
-        } else if (m.presetStyle === "SDXL (写实/通用)") {
-            sels.sdxl.append(opt);
-        } else if (m.presetStyle === "SD 1.5 (动漫/韩漫2.5D)") {
-            sels.sd15_anime.append(opt);
-        } else if (m.presetStyle === "SD 1.5 (纯写实/真人照)") {
-            sels.sd15_real.append(opt);
+        const searchable = [
+            model.name,
+            model.baseline,
+            model.style,
+            model.familyLabel,
+            model.rawDesc,
+            model.tags.join(" ")
+        ].join(" ").toLowerCase();
+
+        return familyMatch &&
+            (!currentSearch || searchable.includes(currentSearch));
+    });
+
+    // Do not rank different architectures against each other.
+    // The all-family browser is alphabetical; individual families use the score.
+    if (currentFamilyFilter === "all") {
+        models.sort((a, b) => a.name.localeCompare(b.name));
+    } else {
+        models.sort((a, b) => b.score - a.score);
+    }
+
+    $select.empty();
+
+    if (!models.length) {
+        $select.append(
+            '<option value="">No matching active models</option>'
+        );
+        selectedModelName = "";
+        return;
+    }
+
+    models.forEach(model => {
+        const label =
+            `${model.name}${model.nsfw ? " 🔞" : ""} · ` +
+            `${model.workers} workers · ${model.familyLabel}`;
+
+        $select.append(
+            `<option value="${escapeHtml(model.name)}">` +
+            `${escapeHtml(label)}</option>`
+        );
+    });
+
+    if (models.some(model => model.name === previous)) {
+        $select.val(previous);
+        selectedModelName = previous;
+    } else {
+        $select.prop("selectedIndex", 0);
+        selectedModelName = $select.val() || "";
+    }
+}
+
+// --- Model details ---
+function showInfoPanel() {
+    const modelName = selectedModelName || $("#horde-model-select").val();
+    const model = globalModelsData.find(item => item.name === modelName);
+
+    if (!model) {
+        return toastr.warning("Select an available model first.");
+    }
+
+    const perfText = model.performance > 1000
+        ? `${(model.performance / 1000).toFixed(1)}k`
+        : model.performance;
+
+    const etaColor = model.eta === 0
+        ? "var(--success)"
+        : "var(--danger)";
+
+    const paramsHtml = model.params
+        ? `<div><b>Recommended parameters:</b>
+               ${model.params.width} × ${model.params.height},
+               ${escapeHtml(model.params.sampler)},
+               ${model.params.steps} steps,
+               CFG ${model.params.scale},
+               clip skip ${model.params.clip_skip},
+               Karras ${model.params.karras ? "on" : "off"}
+           </div>`
+        : `<div style="color:#ffcc80;">
+               <b>Automatic parameters:</b> Not configured for this architecture.
+               The extension will not guess settings.
+           </div>`;
+
+    let imagesHtml = "";
+
+    model.showcases.forEach(url => {
+        if (typeof url === "string" && /^https:\/\//i.test(url)) {
+            imagesHtml +=
+                `<img src="${escapeHtml(url)}" alt="Model preview" loading="lazy" ` +
+                `style="width:100%;max-width:520px;border-radius:6px;margin-top:10px;">`;
         }
+    });
+
+    if (!imagesHtml) {
+        imagesHtml =
+            '<div style="color:#888;margin-top:8px;">No official preview images available.</div>';
+    }
+
+    const html = `
+        <div style="display:flex;justify-content:space-between;gap:10px;
+                    align-items:start;border-bottom:1px solid #444;
+                    padding-bottom:8px;margin-bottom:10px;">
+            <div style="font-size:16px;font-weight:bold;color:#bb86fc;
+                        overflow-wrap:anywhere;">
+                ${escapeHtml(model.name)} ${model.nsfw ? "🔞" : ""}
+            </div>
+            <button class="menu_button" id="btn-horde-refresh-single"
+                    style="margin:0;white-space:nowrap;">
+                🔄 Refresh Status
+            </button>
+        </div>
+
+        <div style="display:flex;flex-direction:column;gap:8px;">
+            <div><b>Family:</b> ${escapeHtml(model.familyLabel)}</div>
+            <div><b>Baseline:</b> ${escapeHtml(model.baseline)}</div>
+            <div><b>Version:</b> ${escapeHtml(model.version)}</div>
+            <div><b>Reference style:</b> ${escapeHtml(model.style)}</div>
+
+            <div>
+                <b>Performance:</b> ${escapeHtml(perfText)}
+                · <b>Workers:</b> ${model.workers}
+                · <b>Queued jobs:</b> ${model.jobs}
+                · <b>ETA:</b>
+                <span style="color:${etaColor};">${model.eta}s</span>
+            </div>
+
+            <div>
+                <b>Radar score:</b> ${Math.round(model.score)}
+                <span style="color:#999;font-size:11px;">
+                    (compare only within the same family)
+                </span>
+            </div>
+
+            ${paramsHtml}
+
+            <div style="margin-top:6px;padding:9px;background:#111;
+                        border-left:3px solid #03dac6;overflow-wrap:anywhere;">
+                <b>Model Description</b>
+                <div style="color:#ccc;line-height:1.5;margin-top:4px;">
+                    ${escapeHtml(
+                        model.rawDesc ||
+                        "No description supplied by the model reference."
+                    )}
+                </div>
+            </div>
+
+            <div style="font-weight:bold;color:#bb86fc;margin-top:4px;">
+                Official Preview Images
+            </div>
+            ${imagesHtml}
+        </div>
+    `;
+
+    $("#horde-info-panel").html(html).slideDown(180);
+
+    $("#btn-horde-refresh-single").on("click", () => {
+        refreshSingleModel(model.name);
     });
 }
 
-// --- 5. Model information panel ---
-function showInfoPanel(targetId) {
-    const selName = $(`#horde-sel-${targetId}`).val();
+// --- Refresh one model's live status ---
+async function refreshSingleModel(modelName) {
+    const $button = $("#btn-horde-refresh-single");
+    const oldText = $button.text();
 
-    if (!selName) {
-        toastr.warning("Please select a model from the dropdown first.");
-        return;
-    }
-
-    const m = globalModelsData.find(x => x.name === selName);
-
-    if (!m) {
-        toastr.error("The selected model could not be found. Refresh the radar and try again.");
-        return;
-    }
-
-    const modelDesc = m.rawDesc || "No description provided by the model reference.";
-
-    let imgHtml = '';
-
-    if (m.showcases.length > 0) {
-        m.showcases.forEach(url => {
-            imgHtml += `<img src="${url}" alt="Model preview" style="width:100%; border-radius:6px; margin-top:10px;">`;
-        });
-    } else {
-        imgHtml = `
-            <div style="text-align:center; padding:10px; color:#666; border:1px dashed #444; margin-top:10px;">
-                No official preview images available
-            </div>
-        `;
-    }
-
-    // Format performance
-    const perfText = m.performance > 1000
-        ? (m.performance / 1000).toFixed(1) + 'k'
-        : m.performance;
-
-    const etaColor = m.eta === 0 ? 'var(--success)' : 'var(--danger)';
-
-    const html = `
-        <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #444; padding-bottom: 8px; margin-bottom: 10px;">
-
-            <div style="font-size: 16px; font-weight: bold; color: #bb86fc; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
-                ${m.name} ${m.nsfw ? '<span style="color:#ff5252">🔞</span>' : ''}
-            </div>
-
-            <div style="display: flex; gap: 6px; flex-shrink: 0;">
-                <button class="menu_button btn-horde-refresh-single" data-model="${m.name}" style="margin: 0; padding: 6px 12px; font-weight: bold; border-radius: 6px;">🔄 Refresh</button>
-
-                <button class="menu_button btn-horde-sync-direct" data-model="${m.name}" style="margin: 0; padding: 6px 12px; font-weight: bold; border-radius: 6px;">⚙️ Sync Now</button>
-            </div>
-        </div>
-
-        <div style="display: flex; flex-direction: column; gap: 8px; margin-bottom: 15px;">
-
-            <div style="background:#000; padding:6px 8px; border-radius:4px;">
-                🎯 Style: <span style="color:#eee">${displayPresetStyle(m.presetStyle)}</span>
-            </div>
-
-            <div style="background:#000; padding:6px 8px; border-radius:4px;">
-                🏗️ Architecture: <span style="color:#eee">${m.baseline} (v${m.version})</span>
-            </div>
-
-            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px;">
-
-                <div style="background:#000; padding:6px 8px; border-radius:4px;">
-                    ⚡ Performance: <span id="info-val-perf" style="color:#ffb74d; font-weight:bold;">${perfText}</span>
-                </div>
-
-                <div style="background:#000; padding:6px 8px; border-radius:4px;">
-                    💻 Workers: <span id="info-val-workers" style="color:var(--success); font-weight:bold;">${m.workers} workers</span>
-                </div>
-
-                <div style="background:#000; padding:6px 8px; border-radius:4px;">
-                    ⚙️ Queue: <span id="info-val-jobs" style="color:#03dac6; font-weight:bold;">${m.jobs} jobs</span>
-                </div>
-
-                <div style="background:#000; padding:6px 8px; border-radius:4px;">
-                    ⏱️ ETA: <span id="info-val-eta" style="color:${etaColor}; font-weight:bold;">${m.eta}s</span>
-                </div>
-
-            </div>
-
-            <div style="background:#111; border: 1px solid #333; padding:8px; border-radius:4px; text-align: center;">
-                🏆 Radar Score: <span id="info-val-score" style="color:#bb86fc; font-size:16px; font-weight:bold;">${Math.round(m.score)}</span>
-            </div>
-
-        </div>
-
-        <div style="background:#2a2a2a; border-left:3px solid #03dac6; padding:8px 10px; margin-bottom:15px; border-radius: 0 4px 4px 0;">
-            <div style="color:#fff; font-weight:bold; margin-bottom:4px;">Model Description:</div>
-            <div style="color:#ccc; line-height: 1.5;">${modelDesc}</div>
-        </div>
-
-        <div style="font-weight:bold; color:#bb86fc;">🖼️ Official Preview Images:</div>
-        ${imgHtml}
-    `;
-
-    $('#horde-info-panel').html(html).slideDown(200);
-}
-
-// --- 6. Refresh the live status of a single model ---
-async function refreshSingleModel(btnObj) {
-    const modelName = btnObj.data('model');
-
-    if (!modelName) return;
-
-    const originalText = btnObj.html();
-    btnObj.html('⏳...').prop('disabled', true);
+    $button.text("Refreshing...").prop("disabled", true);
 
     try {
-        const res = await fetch('https://aihorde.net/api/v2/status/models');
+        const statuses = await fetchJson(
+            "https://aihorde.net/api/v2/status/models"
+        );
 
-        if (!res.ok) {
-            throw new Error(`HTTP ${res.status}`);
+        const live = statuses.find(
+            item => item.name === modelName && item.type === "image"
+        );
+
+        const model = globalModelsData.find(
+            item => item.name === modelName
+        );
+
+        if (!live || !model) {
+            toastr.warning(
+                "This model is no longer reporting active workers. " +
+                "Refresh the full radar for the latest list."
+            );
+            return;
         }
 
-        const statusData = await res.json();
-        const liveData = statusData.find(m => m.name === modelName);
+        model.workers = Number(live.count) || 0;
+        model.performance = Math.round(Number(live.performance) || 0);
+        model.eta = Number(live.eta) || 0;
+        model.jobs = Number(live.jobs) || 0;
+        model.score = calculateModelScore(live);
 
-        if (liveData) {
-            const mInfo = globalModelsData.find(x => x.name === modelName);
+        renderModelList();
+        showInfoPanel();
 
-            if (mInfo) {
-                // Update in-memory data
-                mInfo.workers = liveData.count;
-                mInfo.performance = Math.round(liveData.performance);
-                mInfo.eta = liveData.eta;
-                mInfo.jobs = liveData.jobs;
-                mInfo.score = calculateModelScore(liveData);
-
-                // Update the UI in place
-                const perfText = mInfo.performance > 1000
-                    ? (mInfo.performance / 1000).toFixed(1) + 'k'
-                    : mInfo.performance;
-
-                const etaColor = mInfo.eta === 0 ? 'var(--success)' : 'var(--danger)';
-
-                $('#info-val-perf').text(perfText);
-                $('#info-val-workers').text(mInfo.workers + ' workers');
-                $('#info-val-jobs').text(`${mInfo.jobs} jobs`);
-                $('#info-val-eta').text(`${mInfo.eta}s`).css('color', etaColor);
-                $('#info-val-score').text(Math.round(mInfo.score));
-
-                // Keep the model dropdown counts up to date as well.
-                const option = $(`#horde-sel-all option[value="${CSS.escape(modelName)}"]`);
-                if (option.length) {
-                    option.text(`${mInfo.name} ${mInfo.nsfw ? '🔞' : ''} (${mInfo.workers} workers)`);
-                }
-
-                toastr.success(`Live status updated for ${modelName}`);
-            }
-        } else {
-            toastr.warning('This model may have no workers online right now.');
-        }
-    } catch (e) {
-        console.error('AI Horde Radar: Failed to refresh live status.', e);
-        toastr.error('Failed to refresh live status. Check your connection.');
+        toastr.success(`Live status updated for ${modelName}.`);
+    } catch (error) {
+        console.error(
+            "AI Horde Radar: single-model refresh failed.",
+            error
+        );
+        toastr.error(
+            "Failed to refresh model status. Check your connection."
+        );
     } finally {
-        btnObj.html(originalText).prop('disabled', false);
+        $("#btn-horde-refresh-single")
+            .text(oldText)
+            .prop("disabled", false);
     }
 }
 
-// --- 7. Full parameter synchronization ---
-function syncToST(targetId) {
-    const selName = $(`#horde-sel-${targetId}`).val();
+// --- Sync model, compatible parameters, and optional style ---
+function executeSync(modelName) {
+    const model = globalModelsData.find(
+        item => item.name === modelName
+    );
 
-    if (!selName) {
-        toastr.warning("Please select a model from the dropdown to sync.");
-        return;
-    }
-
-    executeSync(selName);
-}
-
-// Core sync logic, also callable directly by model name
-function executeSync(selName) {
-    const m = globalModelsData.find(x => x.name === selName);
-
-    if (!m) {
-        toastr.error("The selected model could not be found. Refresh the radar and try again.");
-        return;
+    if (!model) {
+        return toastr.error(
+            "The selected model is no longer in the active model list. Refresh the radar."
+        );
     }
 
     const sd = extension_settings.sd;
 
-    sd.model = m.name;
-    $('#sd_model').val(m.name).trigger('change');
+    if (!sd) {
+        return toastr.error(
+            "SillyTavern image-generation settings are unavailable. " +
+            "Open the image-generation panel and try again."
+        );
+    }
 
-    const p = m.params;
+    // Always sync the model, even if no matching style exists.
+    sd.model = model.name;
+    $("#sd_model").val(model.name).trigger("change");
 
-    sd.width = p.width;
-    $('#sd_width').val(p.width).trigger('input');
+    // Change generation parameters only for supported, configured families.
+    if (model.params) {
+        const p = model.params;
 
-    sd.height = p.height;
-    $('#sd_height').val(p.height).trigger('input');
+        sd.width = p.width;
+        $("#sd_width").val(p.width).trigger("input");
 
-    sd.sampler = p.sampler;
-    $('#sd_sampler').val(p.sampler).trigger('change');
+        sd.height = p.height;
+        $("#sd_height").val(p.height).trigger("input");
 
-    sd.steps = p.steps;
-    $('#sd_steps').val(p.steps).trigger('input');
+        sd.sampler = p.sampler;
+        $("#sd_sampler").val(p.sampler).trigger("change");
 
-    sd.scale = p.scale;
-    $('#sd_scale').val(p.scale).trigger('input');
+        sd.steps = p.steps;
+        $("#sd_steps").val(p.steps).trigger("input");
 
-    sd.clip_skip = p.clip_skip;
-    $('#sd_clip_skip').val(p.clip_skip).trigger('input');
+        sd.scale = p.scale;
+        $("#sd_scale").val(p.scale).trigger("input");
 
-    sd.horde_karras = p.karras;
-    $('#sd_horde_karras').prop('checked', p.karras).trigger('change');
+        sd.clip_skip = p.clip_skip;
+        $("#sd_clip_skip").val(p.clip_skip).trigger("input");
 
-    $('#sd_resolution').val(`${p.width}x${p.height}`).trigger('change');
+        sd.horde_karras = p.karras;
+        $("#sd_horde_karras")
+            .prop("checked", p.karras)
+            .trigger("change");
 
-    const targetStyle = m.presetStyle;
-    const styleObj = sd.styles.find(s => s.name === targetStyle);
+        $("#sd_resolution")
+            .val(`${p.width}x${p.height}`)
+            .trigger("change");
+    }
+
+    // A style is optional. Missing styles never block model synchronization.
+    let appliedStyle = false;
+    const styles = Array.isArray(sd.styles) ? sd.styles : [];
+    const candidates = getStyleCandidates(model);
+
+    const styleObj = styles.find(style =>
+        candidates.includes(style.name)
+    );
 
     if (styleObj) {
-        sd.style = targetStyle;
-        sd.prompt_prefix = styleObj.prefix;
-        sd.negative_prompt = styleObj.negative;
+        sd.style = styleObj.name;
+        sd.prompt_prefix = styleObj.prefix || "";
+        sd.negative_prompt = styleObj.negative || "";
 
-        $('#sd_style').val(targetStyle).trigger('change');
-        $('#sd_prompt_prefix').val(styleObj.prefix).trigger('input');
-        $('#sd_negative_prompt').val(styleObj.negative).trigger('input');
-    } else {
-        toastr.error(
-            `Could not find the style preset "${targetStyle}" in SillyTavern. Create it in the image-generation panel first.`,
-            "Sync Warning"
-        );
+        $("#sd_style").val(styleObj.name).trigger("change");
+        $("#sd_prompt_prefix")
+            .val(styleObj.prefix || "")
+            .trigger("input");
+        $("#sd_negative_prompt")
+            .val(styleObj.negative || "")
+            .trigger("input");
+
+        appliedStyle = true;
     }
 
     saveSettingsDebounced();
 
-    toastr.success(
-        `All parameters applied!\nModel: ${m.name}\nStyle: ${displayPresetStyle(targetStyle)}`,
-        'AI Horde Sync',
-        { timeOut: 3000 }
-    );
+    if (!model.params) {
+        toastr.warning(
+            `Model selected: ${model.name}. No automatic parameters are ` +
+            `configured for ${model.familyLabel}; existing generation ` +
+            `settings were left unchanged.`
+        );
+    } else if (!appliedStyle) {
+        toastr.warning(
+            `Model and recommended parameters synced for ${model.name}. ` +
+            `No matching optional style preset was found, so your current ` +
+            `style and prompts were left unchanged.`
+        );
+    } else {
+        toastr.success(
+            `Model, parameters, and style synced for ${model.name}.`,
+            "AI Horde Radar",
+            { timeOut: 3500 }
+        );
+    }
 }
